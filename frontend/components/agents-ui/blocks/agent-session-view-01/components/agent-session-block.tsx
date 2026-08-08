@@ -155,6 +155,47 @@ export interface AgentSessionView_01Props {
   className?: string;
 }
 
+function SpeakerStatus({ state }: { state: string }) {
+  let statusText = 'Connected';
+  let badgeColor = 'bg-muted/30 border-border/40';
+  let pulseColor = 'bg-muted-foreground/40';
+  let textColor = 'text-muted-foreground';
+
+  if (state === 'connecting' || state === 'initializing') {
+    statusText = 'Secure connection...';
+    badgeColor = 'bg-blue-500/10 border-blue-500/20';
+    pulseColor = 'bg-blue-500';
+    textColor = 'text-blue-600 dark:text-blue-400';
+  } else if (state === 'thinking') {
+    statusText = 'Samar is thinking...';
+    badgeColor = 'bg-amber-500/10 border-amber-500/20';
+    pulseColor = 'bg-amber-500';
+    textColor = 'text-amber-600 dark:text-amber-400';
+  } else if (state === 'listening') {
+    statusText = 'Listening to you';
+    badgeColor = 'bg-emerald-500/10 border-emerald-500/20';
+    pulseColor = 'bg-emerald-500';
+    textColor = 'text-emerald-600 dark:text-emerald-400';
+  } else if (state === 'speaking') {
+    statusText = 'Samar is speaking';
+    badgeColor = 'bg-teal-500/10 border-teal-500/20';
+    pulseColor = 'bg-teal-500';
+    textColor = 'text-teal-600 dark:text-teal-400';
+  }
+
+  return (
+    <div className="flex justify-center items-center pointer-events-none">
+      <div className={cn("flex items-center gap-2 px-4 py-1.5 rounded-full border text-xs font-semibold tracking-wide uppercase transition-all duration-300 shadow-2xs backdrop-blur-xs", badgeColor)}>
+        <span className="relative flex h-2 w-2">
+          <span className={cn("animate-ping absolute inline-flex h-full w-full rounded-full opacity-75", pulseColor)}></span>
+          <span className={cn("relative inline-flex rounded-full h-2 w-2", pulseColor)}></span>
+        </span>
+        <span className={textColor}>{statusText}</span>
+      </div>
+    </div>
+  );
+}
+
 export function AgentSessionView_01({
   preConnectMessage = 'Agent is listening, ask it a question',
   supportsChatInput = true,
@@ -181,6 +222,8 @@ export function AgentSessionView_01({
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const { state: agentState } = useAgent();
 
+  const lastMessage = messages.at(-1);
+
   const controls: AgentControlBarControls = {
     leave: true,
     microphone: true,
@@ -205,8 +248,13 @@ export function AgentSessionView_01({
       {...props}
     >
       <Fade top className="absolute inset-x-4 top-0 z-10 h-40" />
-      {/* transcript */}
 
+      {/* Floating Speaker Status Badge */}
+      <div className="absolute top-20 left-0 right-0 z-40">
+        <SpeakerStatus state={agentState} />
+      </div>
+
+      {/* transcript */}
       <div className="absolute top-0 bottom-[135px] flex w-full flex-col md:bottom-[170px]">
         <AnimatePresence>
           {chatOpen && (
@@ -223,6 +271,7 @@ export function AgentSessionView_01({
           )}
         </AnimatePresence>
       </div>
+
       {/* Tile layout */}
       <TileLayout
         chatOpen={chatOpen}
@@ -236,11 +285,26 @@ export function AgentSessionView_01({
         audioVisualizerGridColumnCount={audioVisualizerGridColumnCount}
         audioVisualizerWaveLineWidth={audioVisualizerWaveLineWidth}
       />
+
       {/* Bottom */}
       <motion.div
         {...BOTTOM_VIEW_MOTION_PROPS}
         className="absolute inset-x-3 bottom-0 z-50 md:inset-x-12"
       >
+        {/* Live Transcript Subtitle Card (Preview when full chat panel is closed) */}
+        {!chatOpen && lastMessage && (
+          <div className="pointer-events-none mx-auto w-full max-w-xl px-4 pb-4 text-center">
+            <div className="inline-block bg-card/75 dark:bg-card/60 border border-border/40 px-4 py-2.5 rounded-xl shadow-md backdrop-blur-md">
+              <p className="text-[10px] uppercase tracking-wider text-primary font-bold mb-1">
+                {lastMessage.from?.isLocal ? 'You' : 'Samar'}
+              </p>
+              <p className="text-sm font-medium text-foreground leading-normal max-h-[64px] overflow-y-auto text-pretty">
+                {lastMessage.text}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Pre-connect message */}
         {isPreConnectBufferEnabled && (
           <AnimatePresence>
