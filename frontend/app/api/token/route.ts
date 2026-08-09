@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { AccessToken, type AccessTokenOptions, type VideoGrant } from 'livekit-server-sdk';
 import { RoomConfiguration } from '@livekit/protocol';
+import { cookies } from 'next/headers';
 
 type ConnectionDetails = {
   serverUrl: string;
@@ -45,8 +46,14 @@ export async function POST(req: Request) {
     }
       
     // Generate participant token
+    const cookieStore = await cookies();
+    let userId = cookieStore.get('voice_agent_user_id')?.value;
+    if (!userId) {
+      userId = `user_${Math.floor(Math.random() * 1000000)}`;
+      cookieStore.set('voice_agent_user_id', userId, { maxAge: 60 * 60 * 24 * 365 }); // 1 year
+    }
     const participantName = 'user';
-    const participantIdentity = `voice_assistant_user_${Math.floor(Math.random() * 10_000)}`;
+    const participantIdentity = userId;
     const roomName = `voice_assistant_room_${Math.floor(Math.random() * 10_000)}`;
 
     const participantToken = await createParticipantToken(
