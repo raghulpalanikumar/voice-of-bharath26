@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, type MotionProps, motion } from 'motion/react';
 import { useAgent, useSessionContext, useSessionMessages } from '@livekit/components-react';
 import { AgentChatTranscript } from '@/components/agents-ui/agent-chat-transcript';
+import { TrendingUp, MapPin, Clock, ArrowRight, X } from 'lucide-react';
 import {
   AgentControlBar,
   type AgentControlBarControls,
@@ -221,6 +222,35 @@ export function AgentSessionView_01({
   const [chatOpen, setChatOpen] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const { state: agentState } = useAgent();
+  const [activeWidget, setActiveWidget] = useState<{
+    type: 'exchange_rate' | 'branches';
+    data: any;
+  } | null>(null);
+
+  useEffect(() => {
+    const room = session.room;
+    if (!room) return;
+
+    const handleDataReceived = (payload: Uint8Array) => {
+      try {
+        const text = new TextDecoder().decode(payload);
+        const eventData = JSON.parse(text);
+        if (eventData.type === 'exchange_rate' || eventData.type === 'branches') {
+          setActiveWidget({
+            type: eventData.type,
+            data: eventData,
+          });
+        }
+      } catch (err) {
+        console.error('Error decoding data packet:', err);
+      }
+    };
+
+    room.on('dataReceived', handleDataReceived);
+    return () => {
+      room.off('dataReceived', handleDataReceived);
+    };
+  }, [session.room]);
 
   const lastMessage = messages.at(-1);
 
@@ -248,6 +278,32 @@ export function AgentSessionView_01({
       {...props}
     >
       <Fade top className="absolute inset-x-4 top-0 z-10 h-40" />
+
+      {/* Floating Visual Card Widget */}
+      <AnimatePresence>
+        {activeWidget && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.9, y: 20 }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="absolute top-36 left-1/2 -translate-x-1/2 md:left-auto md:right-8 md:translate-x-0 z-50 w-[90%] max-w-xs md:max-w-sm overflow-hidden rounded-2xl border border-border/50 bg-card/85 p-4 shadow-xl backdrop-blur-md dark:border-white/10 dark:bg-zinc-900/85"
+          >
+            {activeWidget.type === 'exchange_rate' && (
+              <ExchangeRateWidget
+                data={activeWidget.data}
+                onClose={() => setActiveWidget(null)}
+              />
+            )}
+            {activeWidget.type === 'branches' && (
+              <BranchesWidget
+                data={activeWidget.data}
+                onClose={() => setActiveWidget(null)}
+              />
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Floating Speaker Status Badge */}
       <div className="absolute top-20 left-0 right-0 z-40">
@@ -334,5 +390,115 @@ export function AgentSessionView_01({
         </div>
       </motion.div>
     </section>
+  );
+}
+
+interface ExchangeRateWidgetProps {
+  data: {
+    base: string;
+    target: string;
+    rate: number;
+    amount: number;
+    total: number;
+    last_update: string;
+  };
+  onClose: () => void;
+}
+
+function ExchangeRateWidget({ data, onClose }: ExchangeRateWidgetProps) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between border-b border-border/40 pb-2">
+        <div className="flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-teal-500/10 text-teal-600 dark:text-teal-400">
+            <TrendingUp className="h-4 w-4" />
+          </div>
+          <div>
+            <h4 className="text-sm font-bold text-foreground">Remittance Rates</h4>
+            <p className="text-[10px] text-muted-foreground">Live Currency Exchange</p>
+          </div>
+        </div>
+        <button
+          onClick={onClose}
+          className="hover:bg-muted text-muted-foreground hover:text-foreground rounded-lg p-1 transition-colors"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="bg-muted/40 rounded-xl p-3 text-center border border-border/30">
+        <div className="flex items-center justify-center gap-3 text-lg font-bold text-foreground">
+          <span>{data.amount} {data.base}</span>
+          <ArrowRight className="h-4 w-4 text-muted-foreground" />
+          <span className="text-teal-600 dark:text-teal-400">₹{data.total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span>
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          Conversion rate: 1 {data.base} = ₹{data.rate.toFixed(2)} INR
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground justify-center">
+        <Clock className="h-3 w-3" />
+        <span>As of {data.last_update}</span>
+      </div>
+    </div>
+  );
+}
+
+interface Branch {
+  name: string;
+  address: string;
+  hours: string;
+  phone: string;
+}
+
+interface BranchesWidgetProps {
+  data: {
+    district: string;
+    branches: Branch[];
+    chained: boolean;
+  };
+  onClose: () => void;
+}
+
+function BranchesWidget({ data, onClose }: BranchesWidgetProps) {
+  return (
+    <div className="flex flex-col gap-3 max-h-[300px]">
+      <div className="flex items-center justify-between border-b border-border/40 pb-2">
+        <div className="flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-teal-500/10 text-teal-600 dark:text-teal-400">
+            <MapPin className="h-4 w-4" />
+          </div>
+          <div>
+            <h4 className="text-sm font-bold text-foreground">Nearest Branch</h4>
+            <p className="text-[10px] text-muted-foreground">
+              {data.district} {data.chained && '• Profile Match'}
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={onClose}
+          className="hover:bg-muted text-muted-foreground hover:text-foreground rounded-lg p-1 transition-colors"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="flex flex-col gap-2 overflow-y-auto pr-1 space-y-1.5">
+        {data.branches.map((branch, index) => (
+          <div
+            key={index}
+            className="bg-muted/30 hover:bg-muted/50 rounded-xl p-2.5 border border-border/25 transition-all text-xs text-left"
+          >
+            <div className="font-semibold text-foreground text-[13px]">{branch.name}</div>
+            <div className="text-muted-foreground mt-1 leading-normal text-[11px]">{branch.address}</div>
+            <div className="flex items-center justify-between mt-2 pt-1 border-t border-border/20 text-[10px] text-muted-foreground">
+              <span>⏰ {branch.hours}</span>
+              {branch.phone !== 'N/A' && <span>📞 {branch.phone}</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

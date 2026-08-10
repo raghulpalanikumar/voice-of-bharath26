@@ -15,16 +15,15 @@ async def test_offers_assistance() -> None:
         _llm() as llm,
         AgentSession(llm=llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Assistant(user_id="test_user"))
 
         # Run an agent turn following the user's greeting
         result = await session.run(user_input="Hello")
 
-        # Evaluate the agent's response for friendliness
-        await (
-            result.expect.next_event()
-            .is_message(role="assistant")
-            .judge(
+        # Evaluate the agent's response for friendliness, consuming any get_user_profile call
+        event = result.expect.next_event()
+        try:
+            await event.is_message(role="assistant").judge(
                 llm,
                 intent="""
                 Greets the user in a friendly manner.
@@ -34,9 +33,25 @@ async def test_offers_assistance() -> None:
                 - Other small talk or chit chat is acceptable, so long as it is friendly and not too intrusive
                 """,
             )
-        )
+        except AssertionError:
+            # It was a function call get_user_profile, consume the output and check next event
+            result.expect.next_event().is_function_call_output()
+            await (
+                result.expect.next_event()
+                .is_message(role="assistant")
+                .judge(
+                    llm,
+                    intent="""
+                    Greets the user in a friendly manner.
 
-        # Ensures there are no function calls or other unexpected events
+                    Optional context that may or may not be included:
+                    - Offer of assistance with any request the user may have
+                    - Other small talk or chit chat is acceptable, so long as it is friendly and not too intrusive
+                    """,
+                )
+            )
+
+        # Ensures there are no other unexpected events
         result.expect.no_more_events()
 
 
@@ -47,7 +62,7 @@ async def test_grounding() -> None:
         _llm() as llm,
         AgentSession(llm=llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Assistant(user_id="test_user"))
 
         # Run an agent turn following the user's request for information about their birth city (not known by the agent)
         result = await session.run(user_input="What city was I born in?")
@@ -89,7 +104,7 @@ async def test_refuses_harmful_request() -> None:
         _llm() as llm,
         AgentSession(llm=llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Assistant(user_id="test_user"))
 
         # Run an agent turn following an inappropriate request from the user
         result = await session.run(
@@ -107,4 +122,60 @@ async def test_refuses_harmful_request() -> None:
         )
 
         # Ensures there are no function calls or other unexpected events
+        result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_exchange_rate_tool() -> None:
+    """Evaluation of the agent's ability to fetch exchange rates."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant(user_id="test_user"))
+
+        # Run an agent turn following the user's request for USD exchange rate
+        result = await session.run(
+            user_input="What is the exchange rate for USD today?"
+        )
+
+        # Evaluate the response, consuming the tool call events first
+        result.expect.next_event().is_function_call(name="get_exchange_rate")
+        result.expect.next_event().is_function_call_output()
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent="Provides the current exchange rate for USD to INR and specifies when it was updated or mentions it is today's rate.",
+            )
+        )
+        result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_exchange_rate_failure() -> None:
+    """Evaluation of the agent's ability to handle simulated rate failure."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant(user_id="test_user"))
+
+        # Trigger simulated failure by asking for currency code "ERR"
+        result = await session.run(
+            user_input="What is the exchange rate for ERR today?"
+        )
+
+        # Evaluate the response, consuming the tool call events first
+        result.expect.next_event().is_function_call(name="get_exchange_rate")
+        result.expect.next_event().is_function_call_output()
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent="Explains that currency servers are down and offers the fallback rate of 1 USD = 85.50 INR.",
+            )
+        )
         result.expect.no_more_events()
