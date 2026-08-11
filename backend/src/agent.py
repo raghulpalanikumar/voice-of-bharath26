@@ -1,5 +1,8 @@
 import json
 import logging
+import asyncio
+import base64
+import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -15,9 +18,20 @@ from livekit.agents import (
     function_tool,
     room_io,
     tokenize,
+    tts,
+    utils,
+    APIConnectionError,
+    APIConnectOptions,
+    APIStatusError,
+    APITimeoutError,
 )
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins.murf.tts import (
+    SynthesizeStream as MurfSynthesizeStream,
+    _to_murf_websocket_pkt,
+)
 
 from database import delete_profile, get_profile, init_db, save_profile
 
@@ -27,15 +41,182 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Day 4: Persistent Financial Services Voice Agent (Bharat Digital Bank)
+
+class DynamicLocaleSynthesizeStream(MurfSynthesizeStream):
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        request_id = utils.shortuuid()
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=self._opts.sample_rate,
+            num_channels=1,
+            mime_type="audio/pcm",
+            stream=True,
+        )
+
+        input_sent_event = asyncio.Event()
+        first_chunk_sent_time: float | None = None
+
+        sent_tokenizer_stream = self._tts._sentence_tokenizer.stream()
+        if self._tts._stream_pacer:
+            sent_tokenizer_stream = self._tts._stream_pacer.wrap(
+                sent_stream=sent_tokenizer_stream,
+                audio_emitter=output_emitter,
+            )
+
+        async def _sentence_stream_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal first_chunk_sent_time
+            context_id = utils.shortuuid()
+            first_sent = True
+            async for ev in sent_tokenizer_stream:
+                # Detect language of this specific sentence
+                has_devanagari = any("\u0900" <= char <= "\u097f" for char in ev.token)
+                if has_devanagari:
+                    self._opts.locale = "hi-IN"
+                    logger.info(f"[DynamicLocale] Detected Devanagari, switching stream locale to hi-IN for sentence: '{ev.token}'")
+                else:
+                    self._opts.locale = "en-IN"
+                    logger.info(f"[DynamicLocale] Detected English/Latin text, locking stream locale to en-IN for sentence: '{ev.token}'")
+
+                # Generate the websocket packet using the updated options
+                token_pkt = _to_murf_websocket_pkt(self._opts)
+                token_pkt["context_id"] = context_id
+                token_pkt["text"] = ev.token + " "
+                self._mark_started()
+                await ws.send_str(json.dumps(token_pkt))
+                if first_sent:
+                    first_sent = False
+                    first_chunk_sent_time = time.perf_counter()
+                    if self._tts._is_verbose():
+                        logger.info(
+                            "[Murf TTS] Stream started - context_id=%s, voice=%s, style=%s, locale=%s, "
+                            "min_buffer_size=%d, max_buffer_delay_in_ms=%d, endpoint=%s",
+                            context_id,
+                            self._opts.voice,
+                            self._opts.style,
+                            self._opts.locale,
+                            self._opts.min_buffer_size,
+                            self._opts.max_buffer_delay_in_ms,
+                            self._opts.base_url,
+                        )
+                input_sent_event.set()
+
+            # End packet
+            end_pkt = _to_murf_websocket_pkt(self._opts)
+            end_pkt["context_id"] = context_id
+            end_pkt["end"] = True
+            await ws.send_str(json.dumps(end_pkt))
+            input_sent_event.set()
+
+        async def _input_task() -> None:
+            async for data in self._input_ch:
+                if isinstance(data, self._FlushSentinel):
+                    sent_tokenizer_stream.flush()
+                    continue
+
+                sent_tokenizer_stream.push_text(data)
+
+            sent_tokenizer_stream.end_input()
+
+        async def _recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal first_chunk_sent_time
+            current_segment_id: str | None = None
+            first_audio_received = True
+            await input_sent_event.wait()
+            while True:
+                msg = await ws.receive()
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    logger.error("[Murf TTS] Connection closed unexpectedly")
+                    raise APIStatusError(
+                        "Murf AI connection closed unexpectedly", request_id=request_id
+                    )
+
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.warning("[Murf TTS] Unexpected message type %s", msg.type)
+                    continue
+
+                data = json.loads(msg.data)
+                segment_id = data.get("context_id")
+                if current_segment_id is None:
+                    current_segment_id = segment_id
+                    output_emitter.start_segment(segment_id=current_segment_id)
+                if data.get("audio"):
+                    if first_audio_received:
+                        first_audio_received = False
+                        if first_chunk_sent_time is not None:
+                            ttfb_ms = (time.perf_counter() - first_chunk_sent_time) * 1000.0
+                            if self._tts._is_verbose():
+                                logger.info("[Murf TTS] Murf TTFB (first sentence to first audio): %.2f ms", ttfb_ms)
+                    b64data = base64.b64decode(data["audio"])
+                    output_emitter.push(b64data)
+                elif data.get("final"):
+                    if sent_tokenizer_stream.closed:
+                        output_emitter.end_input()
+                        break
+                else:
+                    logger.warning("[Murf TTS] Unexpected message %s", data)
+
+        try:
+            async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                tasks = [
+                    asyncio.create_task(_input_task()),
+                    asyncio.create_task(_sentence_stream_task(ws)),
+                    asyncio.create_task(_recv_task(ws)),
+                ]
+
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    input_sent_event.set()
+                    await sent_tokenizer_stream.aclose()
+                    await utils.aio.gracefully_cancel(*tasks)
+        except asyncio.TimeoutError:
+            raise APITimeoutError() from None
+        except aiohttp.ClientResponseError as e:
+            logger.error("[Murf TTS] WebSocket error %d: %s", e.status, e.message)
+            raise APIStatusError(
+                message=e.message, status_code=e.status, request_id=None, body=None
+            ) from None
+        except Exception as e:
+            logger.error("[Murf TTS] WebSocket connection failed: %s", str(e))
+            raise APIConnectionError() from e
+
+
+class DynamicLocaleTTS(murf.TTS):
+    def stream(
+        self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> DynamicLocaleSynthesizeStream:
+        stream = DynamicLocaleSynthesizeStream(tts=self, conn_options=conn_options)
+        self._streams.add(stream)
+        return stream
+
+    def synthesize(
+        self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> tts.ChunkedStream:
+        has_devanagari = any("\u0900" <= char <= "\u097f" for char in text)
+        if has_devanagari:
+            self._opts.locale = "hi-IN"
+            logger.info(f"[DynamicLocale] Synthesize: Detected Devanagari, setting locale to hi-IN for text: '{text}'")
+        else:
+            self._opts.locale = "en-IN"
+            logger.info(f"[DynamicLocale] Synthesize: Detected English/Latin, setting locale to en-IN for text: '{text}'")
+        return super().synthesize(text, conn_options=conn_options)
+
+
+# Day 6: Make Outbound Calls (Bharat Digital Bank)
 SYSTEM_PROMPT = """IDENTITY:
-- Name: Samar, warm and polite AI assistant for Bharat Digital Bank.
+- Name: Samar (समर in Hindi), warm and polite AI assistant for Bharat Digital Bank.
 
 OBJECTIVES:
 - Assist users with general banking queries (loan document checklist, interest rates, credit card blocking steps).
+- For outbound calls: Notify the customer that they are eligible for the PM Digital Banking Scheme (PM-DBS) which offers a special 9.5 percent interest rate on Fixed Deposits, and that the registration deadline is approaching (on 15th August 2026). Check if they would like to lock in this rate or ask any questions.
 - Escalate account-specific requests to a human banking officer.
 
 KNOWLEDGE:
+- PM Digital Banking Scheme (PM-DBS) Fixed Deposit interest rate: 9.5 percent per annum. Deadline: 15th August 2026. Only eligible customers (like the caller) can apply before the deadline.
 - Home Loan interest rate: 8.5 percent per annum.
 - Savings Account interest rate: 4 percent per annum.
 - Credit Card blocking: Tell the user to use the Mobile App or call 1800-123-4567.
@@ -49,13 +230,14 @@ PERSISTENT USER MEMORY:
 - You MUST ask for the user's explicit consent before saving any facts or profile information (e.g., "Kya main aapki details save kar sakta hoon?").
 - Only call `save_user_profile` if they give explicit consent.
 
-LANGUAGE & SCRIPT:
-- Always write every language in its own native script.
-- Hindi → Devanagari (e.g. नमस्ते, आप कैसे हैं, ब्याज दर क्या है), never romanized/English text for Hindi words.
-- English → Latin script (e.g. Welcome to Bharat Digital Bank, how can I help you).
+LANGUAGE & SCRIPT
+Always write every language in its own native script.
+Hindi → Devanagari (नमस्ते), never romanized (never "namaste"). Write proper nouns in Devanagari too (e.g. समर instead of Samar, भारत डिजिटल बैंक instead of Bharat Digital Bank) when writing in Hindi.
+Same rule for all non-English languages.
 
 GUARDRAILS:
 - Always call the get_exchange_rate tool for any 3-letter currency code the user asks about, including test or placeholder currency codes like ERR.
+- If the get_exchange_rate tool indicates the servers are offline or returns an error (like for ERR), you MUST explicitly state the fallback rate of 1 USD = 85.50 INR.
 - NEVER ask for or accept OTP, PIN, password, CVV, or full account numbers. If user starts saying them, interrupt gently.
 - NEVER promise or guarantee loan approval. Always say it depends on document verification.
 - NEVER perform transfers, transactions, or state that you have blocked a card yourself.
@@ -63,8 +245,10 @@ GUARDRAILS:
 
 STYLE:
 - Speak naturally like a human on a phone call.
-- Keep responses extremely short (under 15 words) unless listing branch details or exchange rates.
+- Keep responses extremely short (under 15 words) unless listing branch details, exchange rates, or explaining scheme eligibility and deadlines.
 - Do NOT use bullet points, lists, brackets, dashes, emojis, or symbols."""
+
+
 
 
 class Assistant(Agent):
@@ -394,7 +578,7 @@ async def my_agent(ctx: JobContext):
             model="gemini-3.5-flash-lite",
         ),
         # Text-to-speech (TTS) is your agent's voice
-        tts=murf.TTS(
+        tts=DynamicLocaleTTS(
             voice="Samar",
             locale="en-IN",
             style="Conversation",
@@ -423,9 +607,16 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
+    is_outbound = ctx.room.name.startswith("outbound-")
+
     # Fetch profile to see if they are a returning caller
     profile = get_profile(user_id)
-    if profile:
+    if is_outbound:
+        if profile:
+            greeting = f"Namaste {profile['name']} Ji! Main Bharat Digital Bank se Samar bol raha hoon. Aapke account ke liye special PM Digital Banking Scheme ki deadline paas aa rahi hai. Aap is 9.5 percent interest rate scheme ke liye eligible hain. Kya main iski details share karu?"
+        else:
+            greeting = "Namaste! Main Bharat Digital Bank se Samar bol raha hoon. Aapke number par digital banking scheme eligibility hai, jiski deadline paas aa rahi hai. Kya main iski details share karu?"
+    elif profile:
         # Returning user greeting (customized with name and past interaction facts)
         greeting = f"Namaste {profile['name']} Ji! Welcome back to Bharat Digital Bank. Last time humne {profile['facts'].get('notes', 'general banking')} ke baare me baat ki thi. Aaj main aapki kya help kar sakta hoon?"
     else:

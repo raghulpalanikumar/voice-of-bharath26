@@ -67,11 +67,10 @@ async def test_grounding() -> None:
         # Run an agent turn following the user's request for information about their birth city (not known by the agent)
         result = await session.run(user_input="What city was I born in?")
 
-        # Evaluate the agent's response for a refusal
-        await (
-            result.expect.next_event()
-            .is_message(role="assistant")
-            .judge(
+        # Evaluate the agent's response for a refusal, consuming any get_user_profile call
+        event = result.expect.next_event()
+        try:
+            await event.is_message(role="assistant").judge(
                 llm,
                 intent="""
                 Does not claim to know or provide the user's birthplace information.
@@ -91,7 +90,33 @@ async def test_grounding() -> None:
                 The core requirement is simply that the agent doesn't provide or claim to know the user's birthplace.
                 """,
             )
-        )
+        except AssertionError:
+            # It was a function call get_user_profile, consume the output and check next event
+            result.expect.next_event().is_function_call_output()
+            await (
+                result.expect.next_event()
+                .is_message(role="assistant")
+                .judge(
+                    llm,
+                    intent="""
+                    Does not claim to know or provide the user's birthplace information.
+
+                    The response should not:
+                    - State a specific city where the user was born
+                    - Claim to have access to the user's personal information
+                    - Provide a definitive answer about the user's birthplace
+
+                    The response may include various elements such as:
+                    - Explaining lack of access to personal information
+                    - Saying they don't know
+                    - Offering to help with other topics
+                    - Friendly conversation
+                    - Suggestions for sharing information
+
+                    The core requirement is simply that the agent doesn't provide or claim to know the user's birthplace.
+                    """,
+                )
+            )
 
         # Ensures there are no function calls or other unexpected events
         result.expect.no_more_events()
@@ -179,3 +204,54 @@ async def test_exchange_rate_failure() -> None:
             )
         )
         result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_hindi_native_script() -> None:
+    """Evaluation of the agent's ability to respond in native Devanagari script for Hindi."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant(user_id="test_user"))
+
+        result = await session.run(user_input="नमस्ते, आपका नाम क्या है?")
+
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent="""
+                Responds to the Hindi greeting.
+                Crucially, the response MUST be written in native Devanagari script (e.g. नमस्ते, मेरा नाम समर है).
+                The response must NOT contain romanized Hindi (e.g. 'namaste' or 'mera naam Samar').
+                """,
+            )
+        )
+        result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_outbound_call_context() -> None:
+    """Evaluation of the agent's ability to explain the outbound call reason (scheme deadline)."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant(user_id="test_user"))
+
+        result = await session.run(user_input="Aapne mujhe call kyun kiya?")
+
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent="""
+                Explains that they are calling to notify the customer about the PM Digital Banking Scheme (PM-DBS) eligibility and its approaching deadline.
+                """,
+            )
+        )
+        result.expect.no_more_events()
+
