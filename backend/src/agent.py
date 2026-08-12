@@ -33,7 +33,7 @@ from livekit.plugins.murf.tts import (
     _to_murf_websocket_pkt,
 )
 
-from database import delete_profile, get_profile, init_db, save_profile
+from database import delete_profile, get_profile, init_db, save_profile, create_escalation_request
 
 init_db()
 
@@ -213,7 +213,7 @@ SYSTEM_PROMPT = """IDENTITY:
 OBJECTIVES:
 - Assist users with general banking queries (loan document checklist, interest rates, credit card blocking steps).
 - For outbound calls: Notify the customer that they are eligible for the PM Digital Banking Scheme (PM-DBS) which offers a special 9.5 percent interest rate on Fixed Deposits, and that the registration deadline is approaching (on 15th August 2026). Check if they would like to lock in this rate or ask any questions.
-- Escalate account-specific requests to a human banking officer.
+- Identify when to escalate to a human banking officer.
 
 KNOWLEDGE:
 - PM Digital Banking Scheme (PM-DBS) Fixed Deposit interest rate: 9.5 percent per annum. Deadline: 15th August 2026. Only eligible customers (like the caller) can apply before the deadline.
@@ -230,6 +230,16 @@ PERSISTENT USER MEMORY:
 - You MUST ask for the user's explicit consent before saving any facts or profile information (e.g., "Kya main aapki details save kar sakta hoon?").
 - Only call `save_user_profile` if they give explicit consent.
 
+ESCALATION TO HUMAN OFFICER:
+- You MUST initiate human escalation for exactly these two situations:
+  1. Possible Fraud or Suspicious Activity (unauthorized transaction report, stolen card/credentials, suspicious account changes).
+  2. Loan Approval / Credit Decision disputes (immediate decision requests or disputes regarding credit decisions you cannot make).
+- Urgency Levels: Set to 'high' or 'emergency' for potential fraud. Set to 'medium' or 'low' for loan disputes.
+- Permission Flow: Before calling the `create_escalation` tool, you MUST explain to the caller what information you want to send (their name, issue description, urgency, preferred contact method) and explicitly ask for permission. You must state that NO sensitive details (PIN, passwords, OTP) will be shared.
+  - If they say YES, call `create_escalation`.
+  - If they say NO, do NOT create the request. Tell them you cannot escalate without permission, and direct them to contact support at 1800-123-4567.
+- Next Steps: Once the ticket is created, read out the reference ID returned by the tool (e.g. BDB-ESC-1) and explain that a human officer will follow up. Do not promise they will contact them immediately.
+
 LANGUAGE & SCRIPT
 Always write every language in its own native script.
 Hindi → Devanagari (नमस्ते), never romanized (never "namaste"). Write proper nouns in Devanagari too (e.g. समर instead of Samar, भारत डिजिटल बैंक instead of Bharat Digital Bank) when writing in Hindi.
@@ -245,7 +255,7 @@ GUARDRAILS:
 
 STYLE:
 - Speak naturally like a human on a phone call.
-- Keep responses extremely short (under 15 words) unless listing branch details, exchange rates, or explaining scheme eligibility and deadlines.
+- Keep responses extremely short (under 15 words) unless listing branch details, exchange rates, explaining scheme eligibility, or performing the escalation permission flow.
 - Do NOT use bullet points, lists, brackets, dashes, emojis, or symbols."""
 
 
@@ -305,6 +315,50 @@ class Assistant(Agent):
         delete_profile(self.user_id)
         logger.info(f"Deleted profile for {self.user_id}")
         return "Your profile has been deleted and forgotten from the database."
+
+    @function_tool
+    async def create_escalation(
+        self,
+        what_happened: str,
+        what_agent_checked: str,
+        urgency: str,
+        follow_up_method: str,
+    ) -> str:
+        """
+        Creates a support escalation request for a human banking officer to follow up.
+        Call this tool ONLY after identifying a fraud report or loan dispute AND obtaining the user's explicit permission to create the ticket.
+        Ensure NO passwords, PINs, OTPs, or private sensitive account details are included in the description.
+
+        Args:
+            what_happened: A clear, summarized description of the caller's issue or dispute.
+            what_agent_checked: What verification or checks the agent has already done.
+            urgency: Urgency level of the request. Must be one of: 'low', 'medium', 'high', 'emergency'.
+            follow_up_method: The user's preferred way to be contacted (e.g. 'phone call', 'email').
+        """
+        logger.info(
+            f"Escalation requested for user {self.user_id} - Urgency: {urgency}"
+        )
+
+        # Sanitize sensitive words in what_happened & what_agent_checked (Advanced optional feature)
+        clean_happened = what_happened
+        clean_checked = what_agent_checked
+        for sensitive_word in ["pin", "password", "otp", "cvv", "card number"]:
+            # Case insensitive replace
+            import re
+
+            pattern = re.compile(re.escape(sensitive_word), re.IGNORECASE)
+            clean_happened = pattern.sub("[REDACTED]", clean_happened)
+            clean_checked = pattern.sub("[REDACTED]", clean_checked)
+
+        ref_id = create_escalation_request(
+            user_id=self.user_id,
+            what_happened=clean_happened,
+            what_agent_checked=clean_checked,
+            urgency=urgency,
+            follow_up_method=follow_up_method,
+        )
+        return f"Successfully created support ticket with Reference ID {ref_id}. Please inform the user."
+
 
     @function_tool
     async def get_exchange_rate(

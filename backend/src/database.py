@@ -22,8 +22,23 @@ def init_db():
             last_interaction TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            name TEXT,
+            language_preference TEXT,
+            what_happened TEXT,
+            what_agent_checked TEXT,
+            urgency TEXT,
+            follow_up_method TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
 
 
 def get_profile(user_id: str):
@@ -90,3 +105,52 @@ def delete_profile(user_id: str):
         conn.close()
     except Exception as e:
         logger.error(f"Error deleting profile: {e}")
+
+
+def create_escalation_request(
+    user_id: str,
+    what_happened: str,
+    what_agent_checked: str,
+    urgency: str,
+    follow_up_method: str,
+) -> str:
+    logger.info(f"Creating escalation request for user {user_id}")
+    # Get profile name and language if they exist
+    profile = get_profile(user_id)
+    name = profile.get("name") if profile else "Unknown"
+    lang = profile.get("language_preference") if profile else "en-IN"
+
+    import datetime
+    created_at = datetime.datetime.now().isoformat()
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO escalations (
+                user_id, name, language_preference, what_happened,
+                what_agent_checked, urgency, follow_up_method, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """,
+            (
+                user_id,
+                name,
+                lang,
+                what_happened,
+                what_agent_checked,
+                urgency,
+                follow_up_method,
+                created_at,
+            ),
+        )
+        escalation_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        ref_id = f"BDB-ESC-{escalation_id}"
+        logger.info(f"Escalation created successfully with Ref ID: {ref_id}")
+        return ref_id
+    except Exception as e:
+        logger.error(f"Error creating escalation: {e}")
+        return "BDB-ESC-ERROR"
+
