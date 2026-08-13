@@ -36,8 +36,57 @@ def init_db():
             created_at TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS calls (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            channel TEXT,
+            status TEXT DEFAULT 'failed',
+            failure_reason TEXT DEFAULT 'user_hangup',
+            duration INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+def insert_call(call_id: str, user_id: str, channel: str):
+    logger.info(f"Inserting new call record: {call_id} for user {user_id} via {channel}")
+    created_at = datetime.datetime.now().isoformat()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO calls (id, user_id, channel, status, failure_reason, duration, created_at)
+            VALUES (?, ?, ?, 'failed', 'user_hangup', 0, ?)
+            """,
+            (call_id, user_id, channel, created_at),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error inserting call record: {e}")
+
+
+def update_call_outcome(call_id: str, status: str, failure_reason: str | None, duration: int):
+    logger.info(f"Updating call {call_id} outcome to status={status}, reason={failure_reason}, duration={duration}")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE calls
+            SET status = ?, failure_reason = ?, duration = ?
+            WHERE id = ?
+            """,
+            (status, failure_reason, duration, call_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error updating call outcome: {e}")
 
 
 

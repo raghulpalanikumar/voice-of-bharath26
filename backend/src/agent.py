@@ -33,7 +33,25 @@ from livekit.plugins.murf.tts import (
     _to_murf_websocket_pkt,
 )
 
-from database import delete_profile, get_profile, init_db, save_profile, create_escalation_request
+from database import (
+    delete_profile,
+    get_profile,
+    init_db,
+    save_profile,
+    create_escalation_request,
+    insert_call,
+    update_call_outcome,
+)
+
+class CallState:
+    def __init__(self, call_id: str, user_id: str, channel: str):
+        self.call_id = call_id
+        self.user_id = user_id
+        self.channel = channel
+        self.start_time = time.time()
+        self.is_success = False
+        self.failure_reason = "user_hangup"
+        self.turns_count = 0
 
 init_db()
 
@@ -262,9 +280,10 @@ STYLE:
 
 
 class Assistant(Agent):
-    def __init__(self, user_id: str) -> None:
+    def __init__(self, user_id: str, call_state: CallState | None = None) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
         self.user_id = user_id
+        self.call_state = call_state
 
     @function_tool
     async def get_user_profile(self) -> str:
@@ -304,6 +323,9 @@ class Assistant(Agent):
         logger.info(
             f"Saved profile for {self.user_id}: name={name}, lang={language_preference}, facts={facts_dict}"
         )
+        if self.call_state:
+            self.call_state.is_success = True
+            self.call_state.failure_reason = None
         return "User profile saved successfully."
 
     @function_tool
@@ -314,6 +336,9 @@ class Assistant(Agent):
         """
         delete_profile(self.user_id)
         logger.info(f"Deleted profile for {self.user_id}")
+        if self.call_state:
+            self.call_state.is_success = True
+            self.call_state.failure_reason = None
         return "Your profile has been deleted and forgotten from the database."
 
     @function_tool
@@ -357,6 +382,9 @@ class Assistant(Agent):
             urgency=urgency,
             follow_up_method=follow_up_method,
         )
+        if self.call_state:
+            self.call_state.is_success = True
+            self.call_state.failure_reason = None
         return f"Successfully created support ticket with Reference ID {ref_id}. Please inform the user."
 
 
@@ -379,6 +407,9 @@ class Assistant(Agent):
         # Step 4: Handle failure path/simulate outage
         if curr_upper in ("FAIL", "ERR"):
             logger.info("Simulated API failure triggered by currency code 'FAIL'/'ERR'")
+            if self.call_state:
+                self.call_state.is_success = False
+                self.call_state.failure_reason = "tool_failure"
             return (
                 "Error: Bharat Digital Bank currency servers are temporarily offline. "
                 "However, our last recorded fallback rate is 1 USD = 85.50 INR. "
@@ -400,6 +431,9 @@ class Assistant(Agent):
 
                 rates = data.get("rates", {})
                 if curr_upper not in rates:
+                    if self.call_state:
+                        self.call_state.is_success = False
+                        self.call_state.failure_reason = "tool_failure"
                     return f"Error: Currency code '{currency}' is invalid or not supported by our API."
 
                 # rates[curr_upper] is how many foreign units = 1 INR
@@ -438,12 +472,18 @@ class Assistant(Agent):
                 except Exception as pe:
                     logger.error(f"Failed to publish UI update: {pe}")
 
+                if self.call_state:
+                    self.call_state.is_success = True
+                    self.call_state.failure_reason = None
                 return (
                     f"Exchange rate status: success. As of {last_update}, 1 {curr_upper} is equal to "
                     f"{rate_rounded} Indian Rupees. Therefore, {amount} {curr_upper} equals {total_rounded} INR."
                 )
         except Exception as e:
             logger.error(f"API request failed: {e}")
+            if self.call_state:
+                self.call_state.is_success = False
+                self.call_state.failure_reason = "tool_failure"
             return (
                 "Error: Unable to fetch real-time exchange rates due to a connection timeout. "
                 "Our fallback rate is approximately 1 USD = 85.50 INR. "
@@ -589,6 +629,9 @@ class Assistant(Agent):
         chain_announcement = (
             " (using your saved profile location)" if chained_from_profile else ""
         )
+        if self.call_state:
+            self.call_state.is_success = True
+            self.call_state.failure_reason = None
         return (
             f"Found nearest locations in {matched_key.title()}{chain_announcement}: "
             f"We have {branches_str}."
@@ -612,16 +655,24 @@ async def my_agent(ctx: JobContext):
 
     # Find the user's participant identity (default to a fallback if none found)
     user_id = "default_user"
+    channel = "web"
     for p in ctx.room.remote_participants.values():
         user_id = p.identity
+        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            channel = "sip"
         break
 
-    logger.info(f"User connected with ID: {user_id}")
+    logger.info(f"User connected with ID: {user_id} via {channel}")
 
     ctx.log_context_fields = {
         "room": ctx.room.name,
         "user_id": user_id,
     }
+
+    # Initialize Call Tracking
+    call_id = ctx.job.id
+    call_state = CallState(call_id=call_id, user_id=user_id, channel=channel)
+    insert_call(call_id, user_id, channel)
 
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -645,9 +696,41 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    # Track user turns and count as success if they interact for at least 2 turns
+    @session.on("user_input_transcribed")
+    def on_user_input(ev):
+        call_state.turns_count += 1
+        logger.info(f"User turn transcribed: {ev.transcript}. Total turns: {call_state.turns_count}")
+        if call_state.turns_count >= 2:
+            call_state.is_success = True
+            call_state.failure_reason = None
+
+    # Track API or session errors
+    @session.on("error")
+    def on_session_error(ev):
+        call_state.is_success = False
+        call_state.failure_reason = "api_error"
+        logger.error(f"Agent session error: {ev.error}")
+
+    # Register shutdown callback to update call statistics in the database
+    async def on_shutdown():
+        duration = int(time.time() - call_state.start_time)
+        status = "success" if call_state.is_success else "failed"
+        reason = call_state.failure_reason
+        if not call_state.is_success:
+            if call_state.turns_count == 0:
+                reason = "no_response"
+            elif call_state.turns_count < 2:
+                reason = "incomplete_task"
+        
+        update_call_outcome(call_id, status, reason, duration)
+        logger.info(f"Call {call_id} ended. Status: {status}, Reason: {reason}, Duration: {duration}s")
+
+    ctx.add_shutdown_callback(on_shutdown)
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(user_id=user_id),
+        agent=Assistant(user_id=user_id, call_state=call_state),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
