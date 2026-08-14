@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This is a monorepo for a voice AI agent starter, powered by Murf Falcon TTS and LiveKit Agents.
+This is a monorepo for a voice AI agent , powered by Murf Falcon TTS and LiveKit Agents.
 
 ## Repository structure
 
